@@ -5,6 +5,9 @@
 #define SCALING_1_TO_1 0xE6
 #define RESOLUTION_8_COUNTS_PER_MM 3
 
+// 1ms timeout for PS/2 clock signals to prevent freezing on missed interrupts
+#define TIMEOUT_MICROS 1000
+
 enum Commands {
     SET_RESOLUTION = 0xE8,
     REQUEST_DATA = 0xEB,
@@ -18,6 +21,7 @@ PS2Mouse::PS2Mouse(int clockPin, int dataPin) {
     _clockPin = clockPin;
     _dataPin = dataPin;
     _supportsIntelliMouseExtensions = false;
+    _hasError = false;
 }
 
 void PS2Mouse::high(int pin) {
@@ -43,6 +47,7 @@ void PS2Mouse::initialize() {
 }
 
 void PS2Mouse::writeByte(char data) {
+    if (_hasError) return;
     int parityBit = 1;
 
     high(_dataPin);
@@ -57,31 +62,41 @@ void PS2Mouse::writeByte(char data) {
     high(_clockPin);
 
     waitForClockState(LOW);
+    if (_hasError) return;
 
     // data
     for (int i = 0; i < 8; i++) {
         int dataBit = bitRead(data, i);
         writeBit(dataBit);
+        if (_hasError) return;
         parityBit = parityBit ^ dataBit;
     }
 
     // parity bit
     writeBit(parityBit);
+    if (_hasError) return;
 
     // stop bit
     high(_dataPin);
     delayMicroseconds(50);
     waitForClockState(LOW);
+    if (_hasError) return;
 
     // wait for mouse to switch modes
-    while ((digitalRead(_clockPin) == LOW) || (digitalRead(_dataPin) == LOW))
-        ;
+    unsigned long start = micros();
+    while ((digitalRead(_clockPin) == LOW) || (digitalRead(_dataPin) == LOW)) {
+        if (micros() - start > TIMEOUT_MICROS) {
+            _hasError = true;
+            return;
+        }
+    }
 
     // put a hold on the incoming data
     low(_clockPin);
 }
 
 void PS2Mouse::writeBit(int bit) {
+    if (_hasError) return;
     if (bit == HIGH) {
         high(_dataPin);
     } else {
@@ -89,31 +104,47 @@ void PS2Mouse::writeBit(int bit) {
     }
 
     waitForClockState(HIGH);
+    if (_hasError) return;
     waitForClockState(LOW);
 }
 
 char PS2Mouse::readByte() {
+    if (_hasError) return 0;
     char data = 0;
+    int onesCount = 0;
 
     high(_clockPin);
     high(_dataPin);
     delayMicroseconds(50);
     waitForClockState(LOW);
+    if (_hasError) return 0;
     delayMicroseconds(5);
 
     // consume the start bit
     waitForClockState(HIGH);
+    if (_hasError) return 0;
 
     // consume 8 bits of data
     for (int i = 0; i < 8; i++) {
-        bitWrite(data, i, readBit());
+        int bit = readBit();
+        if (_hasError) return 0;
+        bitWrite(data, i, bit);
+        if (bit == HIGH) onesCount++;
     }
 
-    // consume parity bit (ignored)
-    readBit();
+    // consume parity bit
+    int parityBit = readBit();
+    if (_hasError) return 0;
 
     // consume stop bit
-    readBit();
+    int stopBit = readBit();
+    if (_hasError) return 0;
+
+    // Check stop bit and odd parity to discard corrupted data
+    if (stopBit != HIGH || (onesCount + parityBit) % 2 == 0) {
+        _hasError = true;
+        return 0;
+    }
 
     // put a hold on the incoming data
     low(_clockPin);
@@ -122,7 +153,9 @@ char PS2Mouse::readByte() {
 }
 
 int PS2Mouse::readBit() {
+    if (_hasError) return 0;
     waitForClockState(LOW);
+    if (_hasError) return 0;
     int bit = digitalRead(_dataPin);
     waitForClockState(HIGH);
     return bit;
@@ -173,11 +206,17 @@ void PS2Mouse::setResolution(int resolution) {
 }
 
 void PS2Mouse::waitForClockState(int expectedState) {
-    while (digitalRead(_clockPin) != expectedState)
-        ;
+    unsigned long start = micros();
+    while (digitalRead(_clockPin) != expectedState) {
+        if (micros() - start > TIMEOUT_MICROS) {
+            _hasError = true;
+            return;
+        }
+    }
 }
 
 MouseData PS2Mouse::readData() {
+    _hasError = false;
     MouseData data;
 
     requestData();
@@ -189,8 +228,15 @@ MouseData PS2Mouse::readData() {
         data.wheel = readByte();
     }
 
+    if (_hasError) {
+        data.status = 0;
+        data.position.x = 0;
+        data.position.y = 0;
+        data.wheel = 0;
+    }
+
     return data;
-};
+}
 
 void PS2Mouse::requestData() {
     writeAndReadAck(REQUEST_DATA);

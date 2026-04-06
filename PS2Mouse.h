@@ -17,6 +17,7 @@ private:
     int _clockPin;
     int _dataPin;
     bool _supportsIntelliMouseExtensions;
+    bool _hasError;
 
     void high(int pin);
 
